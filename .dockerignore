@@ -1,0 +1,7 @@
+node_modules
+.git
+.tmp-uploads
+npm-debug.log
+*.tar
+*.tar.gz
+*.zip

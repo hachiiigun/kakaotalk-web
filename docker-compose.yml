@@ -1,0 +1,19 @@
+services:
+  kakaotalk:
+    build:
+      context: .
+    image: kakaotalk-wine:local
+    container_name: kakaotalk-wine
+    shm_size: "1gb"
+    ports:
+      - "14500:14500"
+    volumes:
+      - kakao-wine-data:/data
+    restart: unless-stopped
+    environment:
+      WINEPREFIX: /data/wineprefix
+      LANG: ko_KR.UTF-8
+      LC_ALL: ko_KR.UTF-8
+
+volumes:
+  kakao-wine-data:
