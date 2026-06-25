@@ -17,6 +17,7 @@ services:
       WINEPREFIX: /data/wineprefix
       LANG: ko_KR.UTF-8
       LC_ALL: ko_KR.UTF-8
+      TZ: ${TZ:-Asia/Seoul}
       ENABLE_FIREFOX: ${ENABLE_FIREFOX:-false}
 
 volumes:
