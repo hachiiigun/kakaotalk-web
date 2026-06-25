@@ -61,15 +61,6 @@ docker compose up -d
 docker compose down -v
 ```
 
-## 포함하지 않는 것
-
-- Node.js 웹서버
-- Xpra 서버
-- Cloudflare Tunnel 설정
-- Nginx 설정
-- 기존 원본 프로젝트의 공개 웹서비스용 파일
-- `node_modules`
-
 ## 주의
 
 - 로컬/개인용으로만 사용하세요.
