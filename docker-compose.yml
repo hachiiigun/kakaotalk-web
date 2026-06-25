@@ -9,7 +9,7 @@ services:
       - "14500:14500"
     volumes:
       - kakao-wine-data:/data
-      - C:/Users/jhkim/Desktop/kakao-share:/share
+      - /mnt/c/Users/jhkim/Desktop/kakao-share:/share
     restart: unless-stopped
     environment:
       WINEPREFIX: /data/wineprefix
