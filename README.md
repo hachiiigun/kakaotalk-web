@@ -92,6 +92,22 @@ cd /mnt/c/tmp/kakaotalk-web  # 또는 프로젝트를 클론한 경로
 docker compose up -d
 ```
 
+## Windows 시작 시 자동 실행 등록
+
+Windows 로그인 후 자동으로 컨테이너를 실행하려면 PowerShell을 실행한 뒤 아래 명령어를 그대로 입력합니다. 관리자 권한은 필요 없습니다.
+
+```powershell
+Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WSLKakaoTalkWeb' -Value 'powershell.exe -WindowStyle Hidden -Command "wsl --cd /mnt/c/tmp/kakaotalk-web docker compose up -d"'
+```
+
+명령어 동작 원리:
+
+- `powershell.exe -WindowStyle Hidden`: 백그라운드에서 동작하도록 실행 창을 숨깁니다.
+- `wsl --cd /mnt/c/tmp/kakaotalk-web`: WSL을 켜면서 지정된 디렉터리로 바로 이동합니다.
+- `docker compose up -d`: 해당 디렉터리에서 Docker Compose를 백그라운드 모드로 실행합니다.
+
+프로젝트를 다른 경로에 클론했다면 `/mnt/c/tmp/kakaotalk-web` 부분을 본인 프로젝트 경로로 바꿔야 합니다.
+
 ## 파일 전송
 
 Windows 탐색기에서 `.env`에 설정한 공유 폴더에 파일을 넣으면, 카카오톡 파일 첨부창에서 `Z:\share` 폴더로 접근해 바로 선택할 수 있습니다.
