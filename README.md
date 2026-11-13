@@ -1,13 +1,13 @@
 # KakaoTalk Docker (Windows / WSL)
 
-Windows Docker Desktop 또는 WSL(Windows Subsystem for Linux) 환경의 Docker Engine에서 KakaoTalk PC 버전을 실행하고, 브라우저에서 noVNC로 조작하는 개인용 환경입니다.
+Windows Docker Desktop 또는 WSL(Windows Subsystem for Linux) 환경의 Docker Engine에서 KakaoTalk PC 버전을 실행하고, 브라우저에서 [voxl](https://github.com/tembo/voxl)로 조작하는 개인용 환경입니다.
 
 ## 기능
 
 - KakaoTalk PC 버전 포함
 - WineHQ staging 기반 실행
-- 브라우저 접속 화면 제공: noVNC
-- 한글 입력 지원: fcitx5-hangul
+- 브라우저 접속 화면 제공: voxl (H.264 + WebCodecs, 최대 60fps, 비밀번호 로그인)
+- 한글 입력 지원: fcitx5-hangul (오른쪽 Alt·한/영 키·Ctrl+Space로 전환, `docker/fcitx5-config`. voxl 클라이언트는 `docker/voxl-hangul-ime.patch`로 패치해서 빌드)
 - 이모지/특수문자 표시용 Noto 폰트 포함
 - 화면 깜박임 완화를 위한 소프트웨어 렌더링 설정 포함
 - 로그인 상태를 Docker volume에 저장
@@ -70,6 +70,7 @@ mkdir -p ~/kakao-share
 
 ### 4. 빌드 및 컨테이너 실행
 프로젝트 루트 폴더(예: `kakaotalk-web`)에서 아래 명령을 실행합니다.
+첫 빌드는 voxl(Rust)을 소스에서 컴파일하므로 수십 분 걸릴 수 있습니다.
 *(WSL에 직접 설치한 Docker의 경우 권한에 따라 앞에 `sudo`를 붙여야 할 수 있습니다.)*
 
 ```bash
@@ -83,8 +84,12 @@ docker compose up -d
 ### 5. 브라우저로 접속
 아래 주소로 접속하면 브라우저 안에서 카카오톡 화면이 나타납니다.
 ```text
-http://localhost:14500/vnc.html?autoconnect=true&resize=scale
+http://localhost:14500/?token=<VOXL_PASSWORD>
 ```
+
+`.env`의 `VOXL_PASSWORD`를 넣습니다. `?token=` 없이 접속하면 브라우저 로그인 창이 뜨며, 사용자 이름은 아무거나 입력하고 비밀번호만 맞으면 됩니다. 비밀번호를 비워 두면 컨테이너가 시작할 때마다 새로 만들어 `docker logs kakaotalk-wine`에 출력합니다.
+
+WebCodecs를 지원하는 최신 Chrome/Edge/Firefox가 필요합니다. 주소 뒤에 `&stats`를 붙이면 FPS 오버레이가 표시됩니다.
 ## 평소 실행
 
 ```bash
@@ -111,6 +116,8 @@ Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Na
 ## 파일 전송
 
 Windows 탐색기에서 `.env`에 설정한 공유 폴더에 파일을 넣으면, 카카오톡 파일 첨부창에서 `Z:\share` 폴더로 접근해 바로 선택할 수 있습니다.
+
+voxl 화면의 Files 패널에서도 공유 폴더(`/share`)로 파일을 올리거나 내려받을 수 있습니다. 업로드한 파일은 `Z:\share\Downloads`에 저장됩니다.
 
 ## Docker 종료
 

@@ -1,3 +1,37 @@
+FROM ubuntu:24.04 AS voxl-build
+
+ARG VOXL_VERSION=0.3.4
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/root/.cargo/bin:$PATH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        build-essential \
+        pkg-config \
+        clang \
+        libclang-dev \
+        esbuild \
+        libx264-dev \
+        libyuv-dev \
+        libopus-dev \
+        libpulse-dev \
+        libx11-dev \
+        libxext-dev \
+        libxcb1-dev \
+        patch \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+
+# voxl from its crates.io source, patched so the Korean 한/영 key reaches fcitx5 and
+# keys the viewer's own IME swallows are sent by physical key.
+COPY docker/voxl-hangul-ime.patch /tmp/voxl-hangul-ime.patch
+RUN mkdir -p /src \
+    && curl -sSfL "https://crates.io/api/v1/crates/voxl-server/${VOXL_VERSION}/download" | tar -xz -C /src \
+    && cd "/src/voxl-server-${VOXL_VERSION}" \
+    && patch -p1 < /tmp/voxl-hangul-ime.patch \
+    && cargo install --locked --path . --root /opt/voxl
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -18,9 +52,10 @@ RUN dpkg --add-architecture i386 \
         locales \
         dbus-x11 \
         xvfb \
-        x11vnc \
-        novnc \
-        websockify \
+        libx264-164 \
+        libyuv0 \
+        libopus0 \
+        libpulse0 \
         x11-utils \
         fcitx5 \
         xdotool \
@@ -47,11 +82,13 @@ RUN dpkg --add-architecture i386 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=voxl-build /opt/voxl/bin/voxl /usr/local/bin/voxl
 COPY ["default_drive_c/Program Files/Kakao/KakaoTalk", "/opt/kakao/KakaoTalk"]
 COPY docker/entrypoint.sh /usr/local/bin/kakao-entrypoint
 COPY docker/run-kakao.sh /usr/local/bin/run-kakao
 COPY docker/run-firefox.sh /usr/local/bin/run-firefox
 COPY docker/tint2rc /etc/tint2/tint2rc
+COPY docker/fcitx5-config /root/.config/fcitx5/config
 COPY docker/firefox.desktop /usr/share/applications/firefox.desktop
 COPY docker/firefox.xpm /usr/share/pixmaps/firefox.xpm
 

@@ -3,3 +3,5 @@ Dockerfile text eol=lf
 .dockerignore text eol=lf
 docker-compose.yml text eol=lf
 .gitattributes text eol=lf
+*.patch text eol=lf
+docker/fcitx5-config text eol=lf

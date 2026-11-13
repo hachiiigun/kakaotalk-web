@@ -1,0 +1,138 @@
+diff --git a/web/src/client/keyboard.ts b/web/src/client/keyboard.ts
+index 4d091e7..42d3050 100644
+--- a/web/src/client/keyboard.ts
++++ b/web/src/client/keyboard.ts
+@@ -29,6 +29,42 @@ const NAMED: Record<string, number> = {
+ 	' ': 0x20,
+ };
+ for (let i = 1; i <= 24; i++) NAMED['F' + i] = 0xffbd + i;
++// Korean 한/영 and 한자 keys: browsers report them by key (HangulMode/HanjaMode, also
++// on laptops where the physical key is AltRight/ControlRight) or by code (Lang1/Lang2).
++// They go to the remote input method as Hangul / Hangul_Hanja.
++const IME_KEYS: Record<string, number> = {
++	HangulMode: 0xff31,
++	Lang1: 0xff31,
++	HanjaMode: 0xff34,
++	Lang2: 0xff34,
++};
++// US-layout characters by physical key, unshifted then shifted. A local IME turns keys
++// into "Process" keydowns; those are sent by physical key so the remote input method
++// composes, not the local one.
++const US_BY_CODE: Record<string, string> = {
++	Digit1: '1!',
++	Digit2: '2@',
++	Digit3: '3#',
++	Digit4: '4$',
++	Digit5: '5%',
++	Digit6: '6^',
++	Digit7: '7&',
++	Digit8: '8*',
++	Digit9: '9(',
++	Digit0: '0)',
++	Minus: '-_',
++	Equal: '=+',
++	BracketLeft: '[{',
++	BracketRight: ']}',
++	Backslash: '\\|',
++	Semicolon: ';:',
++	Quote: '\'"',
++	Backquote: '`~',
++	Comma: ',<',
++	Period: '.>',
++	Slash: '/?',
++	Space: '  ',
++};
+ const XK_BACKSPACE = 0xff08,
+ 	XK_RETURN = 0xff0d,
+ 	XK_DELETE = 0xffff;
+@@ -79,7 +115,22 @@ export function setupKeyboard(
+ 		return isCtrl ? ctrl : sup;
+ 	}
+ 
++	/** Keysym of a key a local IME swallowed (key "Process"), from its physical key. */
++	function processKeysym(e: KeyboardEvent): number {
++		const c = e.code;
++		// The 한/영 and 한자 keys themselves, when the IME reports them as "Process".
++		if (c === 'AltRight' || c === 'Lang1') return 0xff31;
++		if (c === 'ControlRight' || c === 'Lang2') return 0xff34;
++		if (NAMED[c] !== undefined) return NAMED[c];
++		if (/^Key[A-Z]$/.test(c))
++			return charKeysym((e.shiftKey ? c[3] : c[3].toLowerCase()).codePointAt(0)!);
++		const pair = US_BY_CODE[c];
++		return pair ? charKeysym(pair.codePointAt(e.shiftKey ? 1 : 0)!) : 0;
++	}
++
+ 	function keysymOf(e: KeyboardEvent): number {
++		const ime = IME_KEYS[e.key] ?? IME_KEYS[e.code];
++		if (ime !== undefined) return ime;
+ 		const mod = modifierKeysym(e.code);
+ 		if (mod !== undefined) return mod;
+ 		if (BY_CODE[e.code] !== undefined) {
+@@ -88,7 +139,8 @@ export function setupKeyboard(
+ 		}
+ 		const k = e.key;
+ 		if (NAMED[k] !== undefined) return NAMED[k];
+-		if (!k || k === 'Dead' || k === 'Unidentified' || k === 'Process') return 0;
++		if (k === 'Process') return processKeysym(e);
++		if (!k || k === 'Dead' || k === 'Unidentified') return 0;
+ 		if ([...k].length !== 1) return 0;
+ 		return charKeysym(k.codePointAt(0)!);
+ 	}
+@@ -125,11 +177,33 @@ export function setupKeyboard(
+ 		press(p.code, p.ks);
+ 	}
+ 
++	// Set once a "Process" key went out by physical key: the local IME's composed text
++	// is then a duplicate and is dropped.
++	let imeKeysSent = false;
++	// A local IME can swallow a modifier's keyup (Ctrl after Ctrl+Space), leaving it held
++	// on the desktop so Enter arrives as Ctrl+Enter. Every key event carries the real
++	// modifier state: release modifiers the browser no longer reports as held.
++	function syncModifiers(e: KeyboardEvent) {
++		for (const code of [...down.keys()]) {
++			const held = code.startsWith('Control')
++				? e.ctrlKey
++				: code.startsWith('Shift')
++					? e.shiftKey
++					: code.startsWith('Meta') || code.startsWith('OS')
++						? e.metaKey
++						: code === 'AltLeft'
++							? e.altKey
++							: true;
++			if (!held && code !== e.code) release(code);
++		}
++	}
+ 	function onKeyDown(e: KeyboardEvent) {
+-		if (e.isComposing) return;
++		syncModifiers(e);
++		if (e.isComposing && e.key !== 'Process') return;
+ 		onInteract();
+ 		const ks = keysymOf(e);
+ 		if (!ks) return;
++		if (e.key === 'Process') imeKeysSent = true;
+ 		const accel = isMac ? e.metaKey : e.ctrlKey;
+ 		if (accel && !e.altKey && (e.key === 'v' || e.key === 'V') && !e.repeat) {
+ 			// Let the browser deliver a paste event to the hidden textarea first, so the
+@@ -148,6 +222,12 @@ export function setupKeyboard(
+ 	function onKeyUp(e: KeyboardEvent) {
+ 		e.preventDefault();
+ 		if (pendingPaste && pendingPaste.code === e.code) flushPaste();
++		// Windows IMEs can swallow the 한/영 keydown and deliver only its keyup: tap it.
++		const ime = IME_KEYS[e.key] ?? IME_KEYS[e.code];
++		if (ime !== undefined && !down.has(e.code)) {
++			tap(ime);
++			return;
++		}
+ 		release(e.code);
+ 		// macOS swallows keyups of keys released while Cmd is held.
+ 		if (isMac && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
+@@ -197,7 +277,8 @@ export function setupKeyboard(
+ 			tap(ch === '\n' ? XK_RETURN : charKeysym(ch.codePointAt(0)!));
+ 	}
+ 	kbd.addEventListener('compositionend', (e) => {
+-		if (e.data) typeText(e.data);
++		if (e.data && !imeKeysSent) typeText(e.data);
++		imeKeysSent = false;
+ 		kbd.value = '';
+ 	});
+ 	kbd.addEventListener('input', (e) => {

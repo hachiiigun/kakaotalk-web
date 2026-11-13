@@ -19,6 +19,7 @@ services:
       LC_ALL: ko_KR.UTF-8
       TZ: ${TZ:-Asia/Seoul}
       ENABLE_FIREFOX: ${ENABLE_FIREFOX:-false}
+      VOXL_PASSWORD: ${VOXL_PASSWORD:-}
 
 volumes:
   kakao-wine-data:

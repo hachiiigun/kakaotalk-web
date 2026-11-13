@@ -30,7 +30,7 @@ fi
 
 rm -f /tmp/.X100-lock /tmp/.X11-unix/X100 2>/dev/null || true
 
-Xvfb "$DISPLAY" -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
+Xvfb "$DISPLAY" -screen 0 1280x800x24 -shmem -ac +extension GLX +render -noreset &
 xvfb_pid=$!
 
 sleep 1
@@ -46,21 +46,11 @@ else
 fi
 /usr/local/bin/run-kakao >/tmp/run-kakao.log 2>&1 &
 
-x11vnc \
-  -display "$DISPLAY" \
-  -forever \
-  -shared \
-  -nopw \
-  -listen 0.0.0.0 \
-  -rfbport 5900 \
-  -xkb \
-  -noxdamage \
-  -repeat \
-  -cursor arrow \
-  -fixscreen V=3 \
-  >/tmp/x11vnc.log 2>&1 &
-
-exec websockify \
-  --web=/usr/share/novnc \
-  0.0.0.0:14500 \
-  localhost:5900
+# voxl streams $DISPLAY as H.264 over a WebSocket. Login uses VOXL_PASSWORD
+# (from .env); without it voxl makes one up and prints the sign-in link to the log.
+exec voxl \
+  --addr=0.0.0.0 \
+  --port=14500 \
+  --title=KakaoTalk \
+  --audio-enabled=false \
+  --files-root=/share

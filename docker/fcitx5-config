@@ -1,0 +1,9 @@
+[Hotkey]
+# 트리거 키를 연속으로 누르면 입력기 목록을 돌지 않고 한/영만 전환
+EnumerateWithTriggerKeys=True
+
+# 한/영 전환: 오른쪽 Alt, 한/영 키, Ctrl+Space
+[Hotkey/TriggerKeys]
+0=Alt_R
+1=Hangul
+2=Control+space
