@@ -32,6 +32,17 @@ RUN mkdir -p /src \
     && patch -p1 < /tmp/voxl-hangul-ime.patch \
     && cargo install --locked --path . --root /opt/voxl
 
+FROM ubuntu:24.04 AS bridge-build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+COPY bridge/kakao-bridge.c /tmp/kakao-bridge.c
+RUN mkdir -p /opt/bridge \
+    && x86_64-w64-mingw32-gcc -O2 -Wall -municode /tmp/kakao-bridge.c -o /opt/bridge/kakao-bridge.exe -lws2_32 -luser32 -lshell32 -lole32
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -100,7 +111,10 @@ RUN chmod +x /usr/local/bin/kakao-entrypoint /usr/local/bin/run-kakao /usr/local
          echo "Skipping Windows Firefox installer download"; \
        fi
 
+COPY --from=bridge-build /opt/bridge/kakao-bridge.exe /usr/local/bin/kakao-bridge.exe
+COPY webui /opt/kakao-webui
+
 VOLUME ["/data"]
-EXPOSE 14500
+EXPOSE 14500 14501
 
 ENTRYPOINT ["/usr/local/bin/kakao-entrypoint"]

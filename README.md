@@ -6,7 +6,8 @@ Windows Docker Desktop 또는 WSL(Windows Subsystem for Linux) 환경의 Docker 
 
 - KakaoTalk PC 버전 포함
 - WineHQ staging 기반 실행
-- 브라우저 접속 화면 제공: voxl (H.264 + WebCodecs, 최대 60fps, 비밀번호 로그인)
+- **브라우저 네이티브 웹 UI (`:14501`)**: 로컬 SQLCipher 4 DB(`TalkUserDB.edb`, `chatListInfo.edb`, `chatLogs_*.edb` + `-wal`)를 메모리에서 복호화해 일반 웹 메신저 UI로 표시하고, SSE 실시간 업데이트·사진/파일 조회·메시지 및 파일 전송을 지원
+- **원격 화면 제공 (`:14500`)**: voxl (H.264 + WebCodecs, 최대 60fps, 비밀번호 로그인) — 초기 로그인이나 잠긴 방 수동 열람용으로 병행 제공
 - 한글 입력 지원: fcitx5-hangul (오른쪽 Alt·한/영 키·Ctrl+Space로 전환, `docker/fcitx5-config`. voxl 클라이언트는 `docker/voxl-hangul-ime.patch`로 패치해서 빌드)
 - 이모지/특수문자 표시용 Noto 폰트 포함
 - 화면 깜박임 완화를 위한 소프트웨어 렌더링 설정 포함
@@ -82,12 +83,17 @@ docker compose up -d
 ```
 
 ### 5. 브라우저로 접속
-아래 주소로 접속하면 브라우저 안에서 카카오톡 화면이 나타납니다.
+아래 주소로 접속하면 일반 웹 브라우저에서 카카오톡 대화를 바로 보고 전송할 수 있습니다.
+```text
+http://localhost:14501/?token=<VOXL_PASSWORD>
+```
+
+기존 Wine 원격 화면(voxl)이 필요할 때는 아래 주소로 접속합니다(최초 QR/계정 로그인 등).
 ```text
 http://localhost:14500/?token=<VOXL_PASSWORD>
 ```
 
-`.env`의 `VOXL_PASSWORD`를 넣습니다. `?token=` 없이 접속하면 브라우저 로그인 창이 뜨며, 사용자 이름은 아무거나 입력하고 비밀번호만 맞으면 됩니다. 비밀번호를 비워 두면 컨테이너가 시작할 때마다 새로 만들어 `docker logs kakaotalk-wine`에 출력합니다.
+`.env`의 `VOXL_PASSWORD`를 넣습니다. `?token=` 없이 접속하면 브라우저 로그인 창이 뜨며, `14500`(voxl)은 사용자 이름에 아무 값이나 입력하고 비밀번호만 맞으면 됩니다. 비밀번호를 비워 두면 컨테이너가 시작할 때마다 새로 만들어 로그에 출력합니다.
 
 WebCodecs를 지원하는 최신 Chrome/Edge/Firefox가 필요합니다. 주소 뒤에 `&stats`를 붙이면 FPS 오버레이가 표시됩니다.
 ## 평소 실행
@@ -99,19 +105,20 @@ docker compose up -d
 
 ## Windows 시작 시 자동 실행 등록
 
-Windows 로그인 후 자동으로 컨테이너를 실행하려면 PowerShell을 실행한 뒤 아래 명령어를 그대로 입력합니다. 관리자 권한은 필요 없습니다.
+Windows 로그인 후 Docker 데몬 준비를 기다렸다가 컨테이너를 띄우고 WSL2 배포판이 유휴 상태로 꺼지지 않게 유지하려면, PowerShell에서 아래 명령어를 실행합니다. 관리자 권한은 필요 없습니다.
 
 ```powershell
-Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WSLKakaoTalkWeb' -Value 'powershell.exe -WindowStyle Hidden -Command "wsl --cd /mnt/c/tmp/kakaotalk-web docker compose up -d"'
+Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WSLKakaoTalkWeb' -Value 'wscript.exe "C:\tmp\kakaotalk-web\docker\start-wsl-kakaotalk.vbs"'
 ```
 
 명령어 동작 원리:
 
-- `powershell.exe -WindowStyle Hidden`: 백그라운드에서 동작하도록 실행 창을 숨깁니다.
-- `wsl --cd /mnt/c/tmp/kakaotalk-web`: WSL을 켜면서 지정된 디렉터리로 바로 이동합니다.
-- `docker compose up -d`: 해당 디렉터리에서 Docker Compose를 백그라운드 모드로 실행합니다.
+- [start-wsl-kakaotalk.vbs](docker/start-wsl-kakaotalk.vbs): 콘솔 창 없이 숨김(`0`) 모드로 WSL Ubuntu의 부팅 래퍼를 실행합니다.
+- [wsl-boot.sh](docker/wsl-boot.sh): `docker info`가 응답할 때까지 최대 60초 대기한 뒤 `docker compose up -d`를 실행합니다.
+- 유휴 종료 방지 및 중복 실행 차단: `flock` 잠금으로 단일 `sleep infinity` 유지 세션을 실행해 WSL2 유휴 종료를 막고, 중복 호출은 즉시 종료합니다.
+- 부팅 로그: 실행 결과는 `.harness/logs/wsl-boot.log`에 남습니다.
 
-프로젝트를 다른 경로에 클론했다면 `/mnt/c/tmp/kakaotalk-web` 부분을 본인 프로젝트 경로로 바꿔야 합니다.
+프로젝트를 다른 경로에 클론했다면 `start-wsl-kakaotalk.vbs`, `wsl-boot.sh` 내부 경로(`/mnt/c/tmp/kakaotalk-web`), 레지스트리 경로를 본인 프로젝트 위치에 맞게 수정해야 합니다.
 
 ## 파일 전송
 

@@ -2,13 +2,15 @@ services:
   kakaotalk:
     build:
       context: .
+      dockerfile: Dockerfile.webui
       args:
         INSTALL_FIREFOX: ${INSTALL_FIREFOX:-false}
-    image: kakaotalk-wine:local
+    image: kakaotalk-wine:webui
     container_name: kakaotalk-wine
     shm_size: "1gb"
     ports:
       - "14500:14500"
+      - "${WEBUI_PORT:-14501}:14501"
     volumes:
       - kakao-wine-data:/data
       - ${KAKAO_SHARE_DIR:-/mnt/c/Users/$USER/Desktop/kakao-share}:/share

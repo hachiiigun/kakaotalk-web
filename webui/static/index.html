@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>카카오톡 웹</title>
+  <link rel="stylesheet" href="/static/styles.css?v=7" />
+</head>
+<body>
+  <div class="app" id="app">
+    <nav class="rail" aria-label="주 메뉴">
+      <div class="rail-top">
+        <button class="rail-btn active" data-nav="chats" title="채팅">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3C6.5 3 2 6.6 2 11c0 2.7 1.7 5.1 4.4 6.6L5.3 21l4.1-2.2c.8.2 1.7.2 2.6.2 5.5 0 10-3.6 10-8s-4.5-8-10-8z"/></svg>
+          <span>채팅</span>
+        </button>
+        <button class="rail-btn" data-nav="open" title="오픈채팅">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+          <span>오픈</span>
+        </button>
+        <button class="rail-btn" data-nav="channels" title="채널">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l3.1 6.3 6.9 1-5 4.9 1.2 6.8L12 17.8 5.8 21 7 14.2 2 9.3l6.9-1L12 2z"/></svg>
+          <span>채널</span>
+        </button>
+        <button class="rail-btn" data-nav="friends" title="친구">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>
+          <span>친구</span>
+        </button>
+      </div>
+      <div class="rail-bottom">
+        <button class="rail-btn" id="btn-scan" title="메모리 키 다시 스캔">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          <span>키스캔</span>
+        </button>
+        <button class="rail-btn" id="btn-theme" title="테마 전환">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+          <span>테마</span>
+        </button>
+        <a class="rail-btn" id="btn-voxl" href="#" target="_blank" rel="noopener noreferrer" title="원격 화면(voxl :14500)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7v2H8v2h8v-2h-2v-2h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg>
+          <span>원격</span>
+        </a>
+        <button class="rail-btn" id="btn-logout" title="로그아웃">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
+          <span>나가기</span>
+        </button>
+      </div>
+    </nav>
+
+    <aside class="sidebar" id="sidebar">
+      <header class="sidebar-head">
+        <div class="sidebar-title-row">
+          <h1 id="sidebar-title">채팅</h1>
+          <span class="status-pill" id="status-pill" title="연결 상태">연결 중</span>
+        </div>
+        <div class="search-box">
+          <input type="search" id="sidebar-search" placeholder="채팅방 이름, 메시지 검색" autocomplete="off" />
+        </div>
+      </header>
+      <div class="sidebar-list" id="sidebar-list" role="list"></div>
+    </aside>
+
+    <main class="chat-pane" id="chat-pane">
+      <div class="empty-stage" id="empty-stage">
+        <div class="empty-logo">Talk</div>
+        <h2>채팅방을 선택하세요</h2>
+        <p id="empty-summary">로컬 카카오톡 DB를 읽어 브라우저에 표시합니다.</p>
+      </div>
+
+      <section class="chat-active hidden" id="chat-active">
+        <header class="chat-header">
+          <button class="icon-btn mobile-back" id="btn-back" title="목록으로">←</button>
+          <div class="chat-header-meta">
+            <div class="chat-header-title-row">
+              <h2 id="room-title">-</h2>
+              <span class="member-badge" id="room-members"></span>
+            </div>
+            <div class="chat-header-sub" id="room-sub">-</div>
+          </div>
+          <div class="chat-header-actions">
+            <button class="icon-btn" id="btn-inroom-search" title="대화 내용 검색">🔍</button>
+            <button class="icon-btn" id="btn-refresh-room" title="새로고침">↻</button>
+          </div>
+        </header>
+
+        <div class="inroom-search hidden" id="inroom-search-bar">
+          <input type="search" id="inroom-search-input" placeholder="이 방에서 메시지 검색 (Enter)" />
+          <button class="mini-btn" id="inroom-search-clear">닫기</button>
+        </div>
+
+        <div class="messages-wrap" id="messages-wrap">
+          <button class="load-more-btn hidden" id="btn-load-more">이전 대화 더 보기</button>
+          <div class="messages-list" id="messages-list"></div>
+          <div class="locked-overlay hidden" id="locked-overlay">
+            <div class="locked-card">
+              <div class="spinner hidden" id="unlock-spinner"></div>
+              <h3 id="locked-title">대화 DB 키 확인 필요</h3>
+              <p id="locked-desc">이 채팅방의 대화 기록을 읽으려면 PC 카카오톡에서 한 번 열어야 합니다.</p>
+              <div class="locked-actions">
+                <button class="primary-btn" id="btn-unlock-room">자동으로 열어 불러오기</button>
+                <a class="secondary-btn" id="btn-open-voxl" href="#" target="_blank" rel="noopener noreferrer">원격 화면(:14500)에서 열기</a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button class="jump-bottom hidden" id="btn-jump-bottom">↓ 최신 메시지</button>
+
+        <div class="emoticon-picker hidden" id="emoticon-picker" role="dialog" aria-label="이모티콘 선택">
+          <div class="emoticon-picker-head">
+            <input type="search" id="emoticon-search" placeholder="키워드 검색 (예: ㅋㅋ, 감사, 하트)" autocomplete="off" />
+            <button class="icon-btn emoticon-close-btn" id="btn-emoticon-close" title="닫기 (Esc)">✕</button>
+          </div>
+          <div class="emoticon-tabs" id="emoticon-tabs" role="tablist"></div>
+          <div class="emoticon-grid-wrap" id="emoticon-grid-wrap">
+            <div class="emoticon-grid" id="emoticon-grid"></div>
+          </div>
+          <div class="emoticon-preview hidden" id="emoticon-preview">
+            <img id="emoticon-preview-img" alt="선택한 이모티콘" />
+            <div class="emoticon-preview-info">
+              <div class="emoticon-preview-title" id="emoticon-preview-title"></div>
+              <div class="emoticon-preview-sub">Enter 또는 전송 버튼으로 보내기</div>
+            </div>
+            <button class="primary-btn emoticon-send-btn" id="btn-emoticon-send">전송</button>
+          </div>
+          <div class="emoticon-picker-foot">더블클릭 또는 선택 후 Enter로 전송 · Ctrl+E / Esc 닫기</div>
+        </div>
+
+        <footer class="composer" id="composer">
+          <input type="file" id="file-input" class="hidden" />
+          <button class="attach-btn" id="btn-attach" title="사진/파일 보내기">＋</button>
+          <button class="attach-btn emoticon-btn" id="btn-emoticon" title="이모티콘 (Ctrl+E)">😊</button>
+          <textarea id="msg-input" rows="1" placeholder="메시지 입력 (Enter 전송, Shift+Enter 줄바꿈, Ctrl+E 이모티콘)"></textarea>
+          <button class="send-btn" id="btn-send" disabled>전송</button>
+        </footer>
+        <div class="readonly-banner hidden" id="readonly-banner">채널(PlusChat)은 읽기 전용입니다.</div>
+      </section>
+    </main>
+  </div>
+
+  <div class="lightbox hidden" id="lightbox" role="dialog" aria-modal="true">
+    <button class="lightbox-close" id="lightbox-close" title="닫기">✕</button>
+    <img id="lightbox-img" alt="확대 이미지" />
+    <a class="lightbox-dl" id="lightbox-dl" download target="_blank" rel="noopener noreferrer">원본 열기</a>
+  </div>
+
+  <div class="toast-host" id="toast-host"></div>
+  <script src="/static/app.js?v=7"></script>
+</body>
+</html>

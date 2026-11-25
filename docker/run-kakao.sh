@@ -38,6 +38,16 @@ cd "$(dirname "$KAKAOTALK_EXE")"
 WINEDEBUG=-all wine "$(basename "$KAKAOTALK_EXE")" &
 wine_pid=$!
 
+# Run lightweight Win32 HTTP bridge inside the same Wine session for Web UI send/open actions.
+(
+  sleep 3
+  while kill -0 "$wine_pid" 2>/dev/null; do
+    WINEDEBUG=-all wine /usr/local/bin/kakao-bridge.exe >>/tmp/kakao-bridge.log 2>&1 || true
+    sleep 2
+  done
+) &
+bridge_loop_pid=$!
+
 # Pull the KakaoTalk window into the visible desktop once. Repeating resize/move
 # causes Wine rendering flicker in noVNC, so do not keep forcing geometry.
 (
@@ -58,4 +68,5 @@ wine_pid=$!
 ) &
 
 wait "$wine_pid"
+kill "$bridge_loop_pid" 2>/dev/null || true
 '

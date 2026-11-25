@@ -46,6 +46,9 @@ else
 fi
 /usr/local/bin/run-kakao >/tmp/run-kakao.log 2>&1 &
 
+# Local DB Web UI (reads encrypted KakaoTalk SQLCipher 4 DBs in RAM + Win32 bridge on 14502)
+python3 /opt/kakao-webui/server.py >/tmp/kakao-webui.log 2>&1 &
+
 # voxl streams $DISPLAY as H.264 over a WebSocket. Login uses VOXL_PASSWORD
 # (from .env); without it voxl makes one up and prints the sign-in link to the log.
 exec voxl \
