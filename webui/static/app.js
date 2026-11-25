@@ -28,6 +28,8 @@ const state = {
 };
 let sidebarReqSeq = 0;
 let sidebarAbort = null;
+let msgReqSeq = 0;
+let msgAbort = null;
 
 const el = (id) => document.getElementById(id);
 const appEl = el('app');
@@ -163,12 +165,29 @@ function toast(msg) {
 }
 
 async function apiJson(url, opts = {}) {
-  const r = await fetch(url, opts);
-  if (r.status === 401) {
-    location.reload();
-    throw new Error('unauthorized');
+  const { timeoutMs = 15000, signal: extSignal, ...rest } = opts;
+  const ctrl = new AbortController();
+  let onExtAbort = null;
+  if (extSignal) {
+    if (extSignal.aborted) {
+      ctrl.abort();
+    } else {
+      onExtAbort = () => ctrl.abort();
+      extSignal.addEventListener('abort', onExtAbort, { once: true });
+    }
   }
-  return r.json();
+  const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  try {
+    const r = await fetch(url, { ...rest, signal: ctrl.signal });
+    if (r.status === 401) {
+      location.reload();
+      throw new Error('unauthorized');
+    }
+    return await r.json();
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (extSignal && onExtAbort) extSignal.removeEventListener('abort', onExtAbort);
+  }
 }
 
 function colorFor(seed) {
@@ -632,10 +651,25 @@ async function selectRoom(chatId, autoUnlock = true) {
 }
 
 async function fetchRoomMessages(chatId, { scrollBottom = false, prepend = false, autoUnlock = false } = {}) {
+  if (!prepend && msgAbort) {
+    try { msgAbort.abort(); } catch (_) {}
+  }
+  const ctrl = new AbortController();
+  if (!prepend) msgAbort = ctrl;
+  const seq = ++msgReqSeq;
+
   const before = prepend && state.messages.length ? state.messages[0].log_id : 0;
   const url = `/api/rooms/${chatId}/messages?limit=80&before_log_id=${before}&q=${encodeURIComponent(state.inRoomSearch)}`;
-  const data = await apiJson(url);
-  if (state.activeRoomId !== chatId) return;
+  let data;
+  try {
+    data = await apiJson(url, { signal: ctrl.signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    if (seq !== msgReqSeq || state.activeRoomId !== chatId) return;
+    toast('대화 내용을 불러오지 못했습니다.');
+    return;
+  }
+  if ((!prepend && seq !== msgReqSeq) || state.activeRoomId !== chatId) return;
 
   const room = data.room;
   state.activeRoom = room;
@@ -1256,20 +1290,28 @@ function closeSSE() {
 window.addEventListener('beforeunload', closeSSE);
 window.addEventListener('pagehide', closeSSE);
 
+let sseRoomsTimer = null;
+let sseRoomMsgTimer = null;
 function connectSSE() {
   closeSSE();
   const es = new EventSource('/api/events');
   activeES = es;
   es.addEventListener('rooms_updated', () => {
-    if (state.nav !== 'friends') loadSidebar();
-    loadStatus();
-    if (state.activeRoomId) fetchRoomMessages(state.activeRoomId);
+    clearTimeout(sseRoomsTimer);
+    sseRoomsTimer = setTimeout(() => {
+      if (state.nav !== 'friends') loadSidebar();
+      loadStatus();
+    }, 450);
   });
   es.addEventListener('room_messages_updated', (ev) => {
     try {
       const d = JSON.parse(ev.data);
       if (d.chat_id && d.chat_id === state.activeRoomId) {
-        fetchRoomMessages(d.chat_id);
+        const targetId = d.chat_id;
+        clearTimeout(sseRoomMsgTimer);
+        sseRoomMsgTimer = setTimeout(() => {
+          if (state.activeRoomId === targetId) fetchRoomMessages(targetId);
+        }, 350);
       }
     } catch (_) {}
   });

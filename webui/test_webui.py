@@ -19,6 +19,9 @@ if str(WEBUI_DIR) not in sys.path:
 from crypto_db import PAGE_SIZE, RESERVE_SIZE, decrypt_bytes_with_wal, derive_hmac_key, verify_sqlcipher4_key
 from kakao_store import (
     _KAKAO_WEBP_XOR_PAD,
+    KakaoStore,
+    build_watermark_index,
+    count_unread_fast,
     decrypt_kakao_webp,
     emoticon_play_filename_from_path,
     emoticon_png_filename_from_path,
@@ -234,6 +237,101 @@ class TestEmoticonHelpers(unittest.TestCase):
         self.assertFalse(is_plain_webp(obfuscated))
         self.assertEqual(decrypt_kakao_webp(obfuscated), plain)
         self.assertEqual(decrypt_kakao_webp(plain), plain)
+
+
+class TestWindowedMessages(unittest.TestCase):
+    def test_unread_watermark_bisect_equivalence(self) -> None:
+        self.assertEqual(count_unread_fast([], {}, "u1", 100), 0)
+        wms = [("u1", 50), ("u2", 80), ("u3", 100), ("u4", 120), ("u2", 90)]
+        sorted_wms, wm_by_uid = build_watermark_index(wms)
+        deduped = list(wm_by_uid.items())
+        for sender in ("u1", "u2", "u3", "u999"):
+            for lid in (10, 50, 80, 90, 95, 100, 120, 200):
+                expected = sum(1 for m_uid, wm in deduped if m_uid != sender and wm < lid)
+                self.assertEqual(count_unread_fast(sorted_wms, wm_by_uid, sender, lid), expected)
+
+        big_wms = [(f"u{i}", i * 10) for i in range(1000)]
+        big_sorted, big_map = build_watermark_index(big_wms)
+        expected_big = sum(1 for m_uid, wm in big_wms if m_uid != "u42" and wm < 5000)
+        self.assertEqual(count_unread_fast(big_sorted, big_map, "u42", 5000), expected_big)
+
+    def test_windowed_messages_pagination_and_reply(self) -> None:
+        key = os.urandom(32)
+        db_salt = os.urandom(16)
+        stmts = [
+            "CREATE TABLE chatLogs ("
+            "logId UNSIGNED BIG INT primary key, authorId UNSIGNED BIG INT, type INTEGER, "
+            "clientMsgId UNSIGNED BIG INT, sendAt INTEGER, message TEXT, attachement TEXT, "
+            "deleted INTEGER DEFAULT 0, threadId UNSIGNED BIG INT DEFAULT 0)"
+        ]
+        # 25 messages: logIds 101..125, plus an ignored type=0 row at 126, plus reply at 125 referencing 110
+        stmts.append("INSERT INTO chatLogs VALUES(126, 1, 0, 0, 2000, 'ignored', '', 0, 0)")
+        for idx in range(1, 26):
+            lid = 100 + idx
+            if lid == 110:
+                msg = "target keyword message"
+            else:
+                msg = f"msg {lid}"
+            if lid == 125:
+                att = '{"src_logId": 110, "src_userId": 2, "src_type": 1}'
+                typ = 26
+            else:
+                att = ""
+                typ = 1
+            stmts.append(f"INSERT INTO chatLogs VALUES({lid}, {1 if idx % 2 else 2}, {typ}, 0, {1000 + idx}, '{msg}', '{att}', 0, 0)")
+
+        plain = _make_sqlite_with_reserve(stmts)
+        enc = b"".join(
+            _encrypt_page(plain[i * PAGE_SIZE : (i + 1) * PAGE_SIZE], i + 1, key, db_salt)
+            for i in range(len(plain) // PAGE_SIZE)
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            acc = Path(td)
+            cdir = acc / "chat_data"
+            cdir.mkdir(parents=True)
+            (cdir / "chatLogs_999.edb").write_bytes(enc)
+
+            store = KakaoStore(key_cache_path=str(acc / "keys.json"))
+            store._account_dir = str(acc)
+            store._my_id = "1"
+            store._users = {
+                "1": {"id": "1", "link_id": "0", "name": "나", "avatar": ""},
+                "2": {"id": "2", "link_id": "0", "name": "상대", "avatar": ""},
+            }
+            room_obj = {
+                "id": "999",
+                "type": "DirectChat",
+                "type_label": "1:1 채팅",
+                "name": "상대",
+                "link_id": "0",
+                "member_count": 2,
+                "unlocked": True,
+                "writable": True,
+            }
+            store._rooms = [room_obj]
+            store._rooms_by_id = {"999": room_obj}
+            store._list_sig = (1, 1)
+            store._user_sig = (1, 1)
+            store._room_watermarks["999"] = [("2", 120)]
+            store._room_wm_index["999"] = build_watermark_index([("2", 120)])
+            store.keys._keys["chatLogs_999.edb"] = key
+
+            p1 = store.get_messages("999", limit=10)
+            self.assertEqual(p1["total"], 25)
+            self.assertTrue(p1["has_more"])
+            self.assertEqual([m["log_id"] for m in p1["messages"]], list(range(116, 126)))
+            self.assertEqual(p1["messages"][-1]["reply_to"]["text"], "target keyword message")
+            self.assertEqual(p1["messages"][-1]["unread"], 1)
+            self.assertEqual(p1["messages"][0]["unread"], 0)
+
+            p2 = store.get_messages("999", limit=10, before_log_id=p1["messages"][0]["log_id"])
+            self.assertTrue(p2["has_more"])
+            self.assertEqual([m["log_id"] for m in p2["messages"]], list(range(106, 116)))
+
+            pq = store.get_messages("999", limit=10, q="TARGET")
+            self.assertEqual([m["log_id"] for m in pq["messages"]], [110])
+
 
 
 if __name__ == "__main__":

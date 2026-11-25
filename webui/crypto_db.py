@@ -92,9 +92,22 @@ class _LibCrypto:
 
 _CRYPTO: _LibCrypto | None = None
 _CRYPTO_LOCK = threading.Lock()
+_CORE_BASE_NAMES = frozenset({"TalkUserDB.edb", "chatListInfo.edb", "emoticon.edb"})
+_CORE_BASE_CACHE: dict[str, tuple[tuple[str, int, int, bytes], bytes, bytes]] = {}
 _BASE_DB_CACHE: OrderedDict[tuple[str, int, int, bytes], tuple[bytes, bytes]] = OrderedDict()
 _BASE_CACHE_LOCK = threading.Lock()
-_MAX_BASE_CACHE = 6
+_MAX_BASE_CACHE = 12
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _path_lock(edb_path: str) -> threading.Lock:
+    with _PATH_LOCKS_GUARD:
+        lk = _PATH_LOCKS.get(edb_path)
+        if lk is None:
+            lk = threading.Lock()
+            _PATH_LOCKS[edb_path] = lk
+        return lk
 
 
 def _crypto() -> _LibCrypto:
@@ -308,48 +321,60 @@ def _read_stable_pair(edb_path: str) -> tuple[bytes, bytes, int, int]:
 def open_decrypted_connection(edb_path: str, enc_key: bytes) -> sqlite3.Connection:
     """Decrypt .edb + -wal and open a read-only in-memory SQLite connection."""
     key_tag = hashlib.sha256(enc_key).digest()[:8]
+    base_name = os.path.basename(edb_path)
+    is_core = base_name in _CORE_BASE_NAMES
     last_err: Exception | None = None
     for _ in range(3):
         try:
-            st = os.stat(edb_path)
-            cache_key = (edb_path, st.st_mtime_ns, st.st_size, key_tag)
-            with _BASE_CACHE_LOCK:
-                cached = _BASE_DB_CACHE.get(cache_key)
-                if cached is not None:
-                    _BASE_DB_CACHE.move_to_end(cache_key)
-
-            if cached is not None:
-                base_salt, cached_base = cached
-                wal_bytes = _read_wal_if_stable(edb_path, st.st_size, st.st_mtime_ns)
-                if wal_bytes is None:
-                    time.sleep(0.12)
-                    continue
-                plain, _ = decrypt_bytes_with_wal(
-                    b"", wal_bytes, enc_key, predecrypted_base=cached_base, base_salt=base_salt
-                )
-            else:
-                edb_bytes, wal_bytes, sz, mtime_ns = _read_stable_pair(edb_path)
-                if not edb_bytes or len(edb_bytes) % PAGE_SIZE != 0:
-                    raise ValueError("encrypted DB must be a non-empty multiple of 4096 bytes")
-                hmac_key = derive_hmac_key(enc_key, edb_bytes[:16])
-                crypto = _crypto()
-                ctx = crypto._ctx_new()
-                if not ctx:
-                    raise MemoryError("EVP_CIPHER_CTX_new failed")
-                out_buf = (ctypes.c_ubyte * (PAGE_SIZE + 16))()
-                try:
-                    base_plain = _decrypt_base_pages(edb_bytes, enc_key, hmac_key, crypto, ctx, out_buf)
-                finally:
-                    crypto._ctx_free(ctx)
-                cache_key = (edb_path, mtime_ns, sz, key_tag)
+            with _path_lock(edb_path):
+                st = os.stat(edb_path)
+                cache_key = (edb_path, st.st_mtime_ns, st.st_size, key_tag)
+                cached: tuple[bytes, bytes] | None = None
                 with _BASE_CACHE_LOCK:
-                    _BASE_DB_CACHE[cache_key] = (edb_bytes[:16], base_plain)
-                    _BASE_DB_CACHE.move_to_end(cache_key)
-                    while len(_BASE_DB_CACHE) > _MAX_BASE_CACHE:
-                        _BASE_DB_CACHE.popitem(last=False)
-                plain, _ = decrypt_bytes_with_wal(
-                    b"", wal_bytes, enc_key, predecrypted_base=base_plain, base_salt=edb_bytes[:16]
-                )
+                    if is_core:
+                        core_entry = _CORE_BASE_CACHE.get(base_name)
+                        if core_entry is not None and core_entry[0] == cache_key:
+                            cached = (core_entry[1], core_entry[2])
+                    else:
+                        cached = _BASE_DB_CACHE.get(cache_key)
+                        if cached is not None:
+                            _BASE_DB_CACHE.move_to_end(cache_key)
+
+                if cached is not None:
+                    base_salt, cached_base = cached
+                    wal_bytes = _read_wal_if_stable(edb_path, st.st_size, st.st_mtime_ns)
+                    if wal_bytes is None:
+                        time.sleep(0.12)
+                        continue
+                    plain, _ = decrypt_bytes_with_wal(
+                        b"", wal_bytes, enc_key, predecrypted_base=cached_base, base_salt=base_salt
+                    )
+                else:
+                    edb_bytes, wal_bytes, sz, mtime_ns = _read_stable_pair(edb_path)
+                    if not edb_bytes or len(edb_bytes) % PAGE_SIZE != 0:
+                        raise ValueError("encrypted DB must be a non-empty multiple of 4096 bytes")
+                    hmac_key = derive_hmac_key(enc_key, edb_bytes[:16])
+                    crypto = _crypto()
+                    ctx = crypto._ctx_new()
+                    if not ctx:
+                        raise MemoryError("EVP_CIPHER_CTX_new failed")
+                    out_buf = (ctypes.c_ubyte * (PAGE_SIZE + 16))()
+                    try:
+                        base_plain = _decrypt_base_pages(edb_bytes, enc_key, hmac_key, crypto, ctx, out_buf)
+                    finally:
+                        crypto._ctx_free(ctx)
+                    cache_key = (edb_path, mtime_ns, sz, key_tag)
+                    with _BASE_CACHE_LOCK:
+                        if is_core:
+                            _CORE_BASE_CACHE[base_name] = (cache_key, edb_bytes[:16], base_plain)
+                        else:
+                            _BASE_DB_CACHE[cache_key] = (edb_bytes[:16], base_plain)
+                            _BASE_DB_CACHE.move_to_end(cache_key)
+                            while len(_BASE_DB_CACHE) > _MAX_BASE_CACHE:
+                                _BASE_DB_CACHE.popitem(last=False)
+                    plain, _ = decrypt_bytes_with_wal(
+                        b"", wal_bytes, enc_key, predecrypted_base=base_plain, base_salt=edb_bytes[:16]
+                    )
 
             conn = sqlite3.connect(":memory:", check_same_thread=False)
             try:

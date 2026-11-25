@@ -1,6 +1,7 @@
 """High-level KakaoTalk data access, attachment normalization, and SSE change watcher."""
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import OrderedDict
 import datetime as dt
 import json
@@ -22,6 +23,8 @@ from crypto_db import (
 
 KST = dt.timezone(dt.timedelta(hours=9))
 MAX_CACHED_ROOMS = 16
+MAX_CACHED_QUERIES = 48
+MAX_WATCHED_ROOMS = 8
 _CHAT_ID_RE = re.compile(r"^\d+$")
 _URL_RE = re.compile(r"https?://[^\s<>\"']+")
 _EMOT_CODE_RE = re.compile(r"^\d{4,12}$")
@@ -142,6 +145,41 @@ def _safe_int(val, default: int = 0) -> int:
         return int(val)
     except (TypeError, ValueError):
         return default
+
+
+def build_watermark_index(wms: list[tuple[str, int]]) -> tuple[list[int], dict[str, int]]:
+    """Build sorted watermark list + per-user map for O(log M) unread counting."""
+    wm_by_uid: dict[str, int] = {}
+    for uid, wm in wms:
+        prev = wm_by_uid.get(uid)
+        if prev is None or wm > prev:
+            wm_by_uid[uid] = wm
+    return sorted(wm_by_uid.values()), wm_by_uid
+
+
+def count_unread_fast(
+    sorted_wms: list[int], wm_by_uid: dict[str, int], sender_uid: str, log_id: int
+) -> int:
+    """Count peers whose watermark < log_id in O(log M), excluding sender_uid."""
+    if not sorted_wms:
+        return 0
+    cnt = bisect_left(sorted_wms, log_id)
+    sender_wm = wm_by_uid.get(sender_uid)
+    if sender_wm is not None and sender_wm < log_id:
+        cnt -= 1
+    return max(0, cnt)
+
+
+class _FeedNameLookup:
+    """Lazy mapping resolving only author IDs actually referenced in feed messages."""
+
+    def __init__(self, resolve_fn, link_id: str) -> None:
+        self._resolve = resolve_fn
+        self._link_id = link_id
+
+    def get(self, key: str, default=None):
+        u = self._resolve(str(key), self._link_id)
+        return u["name"] if u else default
 
 
 def proxy_url(url: str | None) -> str:
@@ -269,12 +307,18 @@ class KakaoStore:
         self._rooms: list[dict] = []
         self._rooms_by_id: dict[str, dict] = {}
         self._room_watermarks: dict[str, list[tuple[str, int]]] = {}
+        self._room_wm_index: dict[str, tuple[list[int], dict[str, int]]] = {}
         self._user_sig: tuple | None = None
         self._list_sig: tuple | None = None
         self._last_rooms_reload: float = 0.0
-        self._chat_cache: OrderedDict[str, tuple[tuple, list[dict]]] = OrderedDict()
+        self._chat_cache: OrderedDict[tuple[str, int, int, str], tuple[tuple, dict]] = OrderedDict()
+        self._watched_rooms: OrderedDict[str, float] = OrderedDict()
         self._emoticon_sig: tuple | None = None
         self._emoticon_cache: dict | None = None
+        self._users_load_lock = threading.Lock()
+        self._rooms_load_lock = threading.Lock()
+        self._room_locks_guard = threading.Lock()
+        self._room_locks: dict[str, threading.Lock] = {}
 
         # SSE subscribers
         self._sub_lock = threading.Lock()
@@ -400,58 +444,74 @@ class KakaoStore:
             for r in self._rooms:
                 r["unlocked"] = self.keys.has(f"chatLogs_{r['id']}.edb")
 
-    def _load_users_if_changed(self) -> bool:
+    def _room_lock(self, chat_id: str) -> threading.Lock:
+        with self._room_locks_guard:
+            lk = self._room_locks.get(chat_id)
+            if lk is None:
+                lk = threading.Lock()
+                self._room_locks[chat_id] = lk
+            return lk
+
+    def _load_users_if_changed(self, blocking: bool = True) -> bool:
         p = self._db_path("TalkUserDB.edb")
         if not p or not os.path.exists(p):
             return False
         sig = file_signature(p)
         if sig == self._user_sig and self._users:
             return False
-        key = self.keys.get("TalkUserDB.edb")
-        if not key:
-            self._ensure_core_keys()
-            key = self.keys.get("TalkUserDB.edb")
-        if not key:
+        if not self._users_load_lock.acquire(blocking=blocking):
             return False
-        conn = open_decrypted_connection(p, key)
         try:
-            users: dict[str, dict] = {}
-            open_users: dict[tuple[str, str], dict] = {}
-            sql = (
-                "SELECT userId, linkId, type, nickName, friendNickName, profileImageUrl, "
-                "statusMessage, directChatId, hidden, purged, favorite "
-                "FROM talkUser WHERE COALESCE(purged, 0) = 0"
-            )
-            for row in conn.execute(sql):
-                uid = str(row["userId"])
-                lid = str(_safe_int(row["linkId"]))
-                fnick = (row["friendNickName"] or "").strip()
-                nick = (row["nickName"] or "").strip()
-                display = fnick or nick or f"사용자 {uid[-4:]}"
-                info = {
-                    "id": uid,
-                    "link_id": lid,
-                    "name": display,
-                    "nick": nick,
-                    "friend_nick": fnick,
-                    "avatar": proxy_url(row["profileImageUrl"]),
-                    "status": (row["statusMessage"] or "").strip(),
-                    "direct_chat_id": str(_safe_int(row["directChatId"]) or ""),
-                    "user_type": _safe_int(row["type"]),
-                    "hidden": bool(_safe_int(row["hidden"])),
-                    "favorite": bool(_safe_int(row["favorite"])),
-                }
-                if lid == "0" or uid not in users:
-                    users[uid] = info
-                if lid != "0":
-                    open_users[(uid, lid)] = info
-            with self._lock:
-                self._users = users
-                self._open_users = open_users
-                self._user_sig = sig
-            return True
+            sig = file_signature(p)
+            if sig == self._user_sig and self._users:
+                return False
+            key = self.keys.get("TalkUserDB.edb")
+            if not key:
+                self._ensure_core_keys()
+                key = self.keys.get("TalkUserDB.edb")
+            if not key:
+                return False
+            conn = open_decrypted_connection(p, key)
+            try:
+                users: dict[str, dict] = {}
+                open_users: dict[tuple[str, str], dict] = {}
+                sql = (
+                    "SELECT userId, linkId, type, nickName, friendNickName, profileImageUrl, "
+                    "statusMessage, directChatId, hidden, purged, favorite "
+                    "FROM talkUser WHERE COALESCE(purged, 0) = 0"
+                )
+                for row in conn.execute(sql):
+                    uid = str(row["userId"])
+                    lid = str(_safe_int(row["linkId"]))
+                    fnick = (row["friendNickName"] or "").strip()
+                    nick = (row["nickName"] or "").strip()
+                    display = fnick or nick or f"사용자 {uid[-4:]}"
+                    info = {
+                        "id": uid,
+                        "link_id": lid,
+                        "name": display,
+                        "nick": nick,
+                        "friend_nick": fnick,
+                        "avatar": proxy_url(row["profileImageUrl"]),
+                        "status": (row["statusMessage"] or "").strip(),
+                        "direct_chat_id": str(_safe_int(row["directChatId"]) or ""),
+                        "user_type": _safe_int(row["type"]),
+                        "hidden": bool(_safe_int(row["hidden"])),
+                        "favorite": bool(_safe_int(row["favorite"])),
+                    }
+                    if lid == "0" or uid not in users:
+                        users[uid] = info
+                    if lid != "0":
+                        open_users[(uid, lid)] = info
+                with self._lock:
+                    self._users = users
+                    self._open_users = open_users
+                    self._user_sig = sig
+                return True
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            self._users_load_lock.release()
 
     def _resolve_user(self, uid: str, link_id: str = "0") -> dict | None:
         if link_id and link_id != "0":
@@ -460,156 +520,167 @@ class KakaoStore:
                 return u
         return self._users.get(uid)
 
-    def _load_rooms_if_changed(self) -> bool:
+    def _load_rooms_if_changed(self, blocking: bool = True) -> bool:
         p = self._db_path("chatListInfo.edb")
         if not p or not os.path.exists(p):
             return False
         sig = file_signature(p)
         if sig == self._list_sig and self._rooms:
             return False
-        key = self.keys.get("chatListInfo.edb")
-        if not key:
-            self._ensure_core_keys()
-            key = self.keys.get("chatListInfo.edb")
-        if not key:
+        if not self._rooms_load_lock.acquire(blocking=blocking):
             return False
-
-        self._load_users_if_changed()
-        conn = open_decrypted_connection(p, key)
         try:
-            members: dict[str, list[tuple[str, int]]] = {}
-            freq: dict[str, int] = {}
-            for r in conn.execute("SELECT chatId, userId, COALESCE(watermark, 0) AS wm FROM chatMembers WHERE COALESCE(isActive, 1) = 1"):
-                cid = str(r["chatId"])
-                uid = str(r["userId"])
-                wm = _safe_int(r["wm"])
-                members.setdefault(cid, []).append((uid, wm))
-                freq[uid] = freq.get(uid, 0) + 1
+            sig = file_signature(p)
+            if sig == self._list_sig and self._rooms:
+                return False
+            key = self.keys.get("chatListInfo.edb")
+            if not key:
+                self._ensure_core_keys()
+                key = self.keys.get("chatListInfo.edb")
+            if not key:
+                return False
 
-            # MemoChat always has at most 1 member (my_id)
-            my_id = max(freq, key=freq.get) if freq else ""
-            raw_rooms = list(conn.execute(
-                "SELECT chatId, type, activeMembersCount, newMessageCount, useCustomChatRoomTitle, "
-                "chatRoomTitle, lastUpdatedAt, lastChatMessage, lastLogId, chatRoomImageUrl, "
-                "isFavorite, alarmOff, directChatMemberId, lastChatMessageType, linkId, "
-                "lastChatMessageAttachment "
-                "FROM chatRoomList"
-            ))
-            for r in raw_rooms:
-                if r["type"] == "MemoChat":
+            self._load_users_if_changed(blocking=not bool(self._users))
+            conn = open_decrypted_connection(p, key)
+            try:
+                members: dict[str, list[tuple[str, int]]] = {}
+                freq: dict[str, int] = {}
+                for r in conn.execute("SELECT chatId, userId, COALESCE(watermark, 0) AS wm FROM chatMembers WHERE COALESCE(isActive, 1) = 1"):
                     cid = str(r["chatId"])
-                    ms = members.get(cid, [])
-                    if ms:
-                        my_id = ms[0][0]
-                    break
+                    uid = str(r["userId"])
+                    wm = _safe_int(r["wm"])
+                    members.setdefault(cid, []).append((uid, wm))
+                    freq[uid] = freq.get(uid, 0) + 1
 
-            rooms: list[dict] = []
-            by_id: dict[str, dict] = {}
-            wms: dict[str, list[tuple[str, int]]] = {}
+                # MemoChat always has at most 1 member (my_id)
+                my_id = max(freq, key=freq.get) if freq else ""
+                raw_rooms = list(conn.execute(
+                    "SELECT chatId, type, activeMembersCount, newMessageCount, useCustomChatRoomTitle, "
+                    "chatRoomTitle, lastUpdatedAt, lastChatMessage, lastLogId, chatRoomImageUrl, "
+                    "isFavorite, alarmOff, directChatMemberId, lastChatMessageType, linkId, "
+                    "lastChatMessageAttachment "
+                    "FROM chatRoomList"
+                ))
+                for r in raw_rooms:
+                    if r["type"] == "MemoChat":
+                        cid = str(r["chatId"])
+                        ms = members.get(cid, [])
+                        if ms:
+                            my_id = ms[0][0]
+                        break
 
-            for r in raw_rooms:
-                cid = str(r["chatId"])
-                typ = str(r["type"] or "")
-                link_id = str(_safe_int(r["linkId"]))
-                room_members = members.get(cid, [])
-                peer_ids = [uid for uid, _ in room_members if uid != my_id]
-                wms[cid] = [(uid, wm) for uid, wm in room_members if uid != my_id]
+                rooms: list[dict] = []
+                by_id: dict[str, dict] = {}
+                wms: dict[str, list[tuple[str, int]]] = {}
 
-                raw_title = (r["chatRoomTitle"] or "").strip()
-                use_custom = _safe_int(r["useCustomChatRoomTitle"])
-                known: list[str] = []
-                if typ == "MemoChat":
-                    name = "나와의 채팅"
-                elif use_custom and raw_title:
-                    name = raw_title
-                elif typ in ("DirectChat", "PlusChat", "OD"):
-                    partner = str(_safe_int(r["directChatMemberId"]) or (peer_ids[0] if peer_ids else ""))
-                    u = self._resolve_user(partner, link_id)
-                    name = (u["name"] if u else "") or raw_title or f"{TYPE_LABELS.get(typ, typ)} {cid[-4:]}"
-                elif raw_title:
-                    name = raw_title
-                else:
-                    for uid in peer_ids[:6]:
-                        u = self._resolve_user(uid, link_id)
-                        if u and u["name"]:
-                            known.append(u["name"])
-                    if known:
-                        name = ", ".join(known[:4]) + (f" 외 {len(peer_ids) - 4}명" if len(peer_ids) > 4 else "")
+                for r in raw_rooms:
+                    cid = str(r["chatId"])
+                    typ = str(r["type"] or "")
+                    link_id = str(_safe_int(r["linkId"]))
+                    room_members = members.get(cid, [])
+                    peer_ids = [uid for uid, _ in room_members if uid != my_id]
+                    wms[cid] = [(uid, wm) for uid, wm in room_members if uid != my_id]
+
+                    raw_title = (r["chatRoomTitle"] or "").strip()
+                    use_custom = _safe_int(r["useCustomChatRoomTitle"])
+                    known: list[str] = []
+                    if typ == "MemoChat":
+                        name = "나와의 채팅"
+                    elif use_custom and raw_title:
+                        name = raw_title
+                    elif typ in ("DirectChat", "PlusChat", "OD"):
+                        partner = str(_safe_int(r["directChatMemberId"]) or (peer_ids[0] if peer_ids else ""))
+                        u = self._resolve_user(partner, link_id)
+                        name = (u["name"] if u else "") or raw_title or f"{TYPE_LABELS.get(typ, typ)} {cid[-4:]}"
+                    elif raw_title:
+                        name = raw_title
                     else:
-                        name = f"{TYPE_LABELS.get(typ, typ or '채팅방')} {cid[-4:]}"
+                        for uid in peer_ids[:6]:
+                            u = self._resolve_user(uid, link_id)
+                            if u and u["name"]:
+                                known.append(u["name"])
+                        if known:
+                            name = ", ".join(known[:4]) + (f" 외 {len(peer_ids) - 4}명" if len(peer_ids) > 4 else "")
+                        else:
+                            name = f"{TYPE_LABELS.get(typ, typ or '채팅방')} {cid[-4:]}"
 
-                # Resolve up to 4 avatars
-                avatars: list[str] = []
-                room_img = proxy_url(r["chatRoomImageUrl"])
-                if room_img:
-                    avatars.append(room_img)
-                elif typ == "MemoChat":
-                    me = self._resolve_user(my_id)
-                    if me and me["avatar"]:
-                        avatars.append(me["avatar"])
-                elif typ in ("DirectChat", "PlusChat", "OD"):
-                    partner = str(_safe_int(r["directChatMemberId"]) or (peer_ids[0] if peer_ids else ""))
-                    u = self._resolve_user(partner, link_id)
-                    if u and u["avatar"]:
-                        avatars.append(u["avatar"])
-                else:
-                    for uid in peer_ids[:4]:
-                        u = self._resolve_user(uid, link_id)
+                    # Resolve up to 4 avatars
+                    avatars: list[str] = []
+                    room_img = proxy_url(r["chatRoomImageUrl"])
+                    if room_img:
+                        avatars.append(room_img)
+                    elif typ == "MemoChat":
+                        me = self._resolve_user(my_id)
+                        if me and me["avatar"]:
+                            avatars.append(me["avatar"])
+                    elif typ in ("DirectChat", "PlusChat", "OD"):
+                        partner = str(_safe_int(r["directChatMemberId"]) or (peer_ids[0] if peer_ids else ""))
+                        u = self._resolve_user(partner, link_id)
                         if u and u["avatar"]:
                             avatars.append(u["avatar"])
+                    else:
+                        for uid in peer_ids[:4]:
+                            u = self._resolve_user(uid, link_id)
+                            if u and u["avatar"]:
+                                avatars.append(u["avatar"])
 
-                last_typ = _safe_int(r["lastChatMessageType"], 1)
-                last_preview = format_last_preview(last_typ, r["lastChatMessage"], r["lastChatMessageAttachment"])
-                me_user = self._resolve_user(my_id)
-                if typ == "MemoChat":
-                    alt_title = raw_title or (me_user["nick"] if me_user and me_user.get("nick") else "")
-                elif typ == "MultiChat" and not raw_title and known:
-                    alt_title = ", ".join(known[:3])
-                else:
-                    alt_title = raw_title
-                item = {
-                    "id": cid,
-                    "type": typ,
-                    "type_label": TYPE_LABELS.get(typ, typ),
-                    "name": name,
-                    "raw_title": raw_title,
-                    "alt_title": alt_title,
-                    "link_id": link_id,
-                    "member_count": _safe_int(r["activeMembersCount"], len(room_members)),
-                    "unread_count": _safe_int(r["newMessageCount"]),
-                    "last_at": _safe_int(r["lastUpdatedAt"]),
-                    "last_log_id": _safe_int(r["lastLogId"]),
-                    "last_message": last_preview,
-                    "avatars": avatars,
-                    "favorite": bool(_safe_int(r["isFavorite"])),
-                    "alarm_off": bool(_safe_int(r["alarmOff"])),
-                    "unlocked": self.keys.has(f"chatLogs_{cid}.edb"),
-                    "writable": typ != "PlusChat",
-                }
-                rooms.append(item)
-                by_id[cid] = item
+                    last_typ = _safe_int(r["lastChatMessageType"], 1)
+                    last_preview = format_last_preview(last_typ, r["lastChatMessage"], r["lastChatMessageAttachment"])
+                    me_user = self._resolve_user(my_id)
+                    if typ == "MemoChat":
+                        alt_title = raw_title or (me_user["nick"] if me_user and me_user.get("nick") else "")
+                    elif typ == "MultiChat" and not raw_title and known:
+                        alt_title = ", ".join(known[:3])
+                    else:
+                        alt_title = raw_title
+                    item = {
+                        "id": cid,
+                        "type": typ,
+                        "type_label": TYPE_LABELS.get(typ, typ),
+                        "name": name,
+                        "raw_title": raw_title,
+                        "alt_title": alt_title,
+                        "link_id": link_id,
+                        "member_count": _safe_int(r["activeMembersCount"], len(room_members)),
+                        "unread_count": _safe_int(r["newMessageCount"]),
+                        "last_at": _safe_int(r["lastUpdatedAt"]),
+                        "last_log_id": _safe_int(r["lastLogId"]),
+                        "last_message": last_preview,
+                        "avatars": avatars,
+                        "favorite": bool(_safe_int(r["isFavorite"])),
+                        "alarm_off": bool(_safe_int(r["alarmOff"])),
+                        "unlocked": self.keys.has(f"chatLogs_{cid}.edb"),
+                        "writable": typ != "PlusChat",
+                    }
+                    rooms.append(item)
+                    by_id[cid] = item
 
-            rooms.sort(key=lambda x: (not x["favorite"], -x["last_at"]))
-            with self._lock:
-                self._my_id = my_id
-                self._rooms = rooms
-                self._rooms_by_id = by_id
-                self._room_watermarks = wms
-                self._list_sig = sig
-            return True
+                rooms.sort(key=lambda x: (not x["favorite"], -x["last_at"]))
+                wm_index = {cid: build_watermark_index(pairs) for cid, pairs in wms.items()}
+                with self._lock:
+                    self._my_id = my_id
+                    self._rooms = rooms
+                    self._rooms_by_id = by_id
+                    self._room_watermarks = wms
+                    self._room_wm_index = wm_index
+                    self._list_sig = sig
+                return True
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            self._rooms_load_lock.release()
 
-    def ensure_loaded(self) -> None:
-        self._ensure_core_keys()
-        self._load_users_if_changed()
-        self._load_rooms_if_changed()
+    def ensure_loaded(self, blocking: bool = True) -> None:
+        if not self.keys.has("TalkUserDB.edb") or not self.keys.has("chatListInfo.edb"):
+            self._ensure_core_keys()
+        self._load_users_if_changed(blocking=blocking)
+        self._load_rooms_if_changed(blocking=blocking)
 
     def status(self) -> dict:
         pid = find_kakaotalk_pid()
         acc = self._acc()
         try:
-            self.ensure_loaded()
+            self.ensure_loaded(blocking=not bool(self._rooms))
         except Exception:
             pass
         with self._lock:
@@ -627,7 +698,7 @@ class KakaoStore:
         }
 
     def list_rooms(self, tab: str = "all", q: str = "") -> list[dict]:
-        self.ensure_loaded()
+        self.ensure_loaded(blocking=not bool(self._rooms))
         needle = q.strip().lower()
         with self._lock:
             items = list(self._rooms)
@@ -649,12 +720,12 @@ class KakaoStore:
     def get_room(self, chat_id: str) -> dict | None:
         if not _CHAT_ID_RE.match(chat_id):
             return None
-        self.ensure_loaded()
+        self.ensure_loaded(blocking=not bool(self._rooms))
         with self._lock:
             return dict(self._rooms_by_id[chat_id]) if chat_id in self._rooms_by_id else None
 
     def list_friends(self, q: str = "", limit: int = 250) -> list[dict]:
-        self.ensure_loaded()
+        self.ensure_loaded(blocking=not bool(self._users))
         needle = q.strip().lower()
         with self._lock:
             all_u = [u for u in self._users.values() if u["link_id"] == "0" and not u["hidden"]]
@@ -666,211 +737,288 @@ class KakaoStore:
         all_u.sort(key=lambda u: (not u["favorite"], u["name"].lower()))
         return all_u[: max(1, min(limit, 1000))]
 
-    def _load_room_messages(self, chat_id: str) -> list[dict] | None:
-        if not _CHAT_ID_RE.match(chat_id):
-            return None
-        kid = f"chatLogs_{chat_id}.edb"
-        p = self._db_path(kid)
-        if not p or not os.path.exists(p):
-            return None
-        key = self.keys.get(kid)
-        if not key:
-            return None
-        sig = file_signature(p)
-        with self._lock:
-            cached = self._chat_cache.get(chat_id)
-            if cached and cached[0] == sig:
-                self._chat_cache.move_to_end(chat_id)
-                return cached[1]
+    def _parse_chat_row(
+        self,
+        r,
+        link_id: str,
+        my_id: str,
+        sorted_wms: list[int],
+        wm_by_uid: dict[str, int],
+        feed_names: _FeedNameLookup,
+        reply_src_map: dict[int, tuple[int, str]],
+    ) -> dict:
+        lid = _safe_int(r["logId"])
+        typ = _safe_int(r["type"], 1)
+        uid = str(r["authorId"])
+        mine = bool(my_id and uid == my_id)
+        u = self._resolve_user(uid, link_id)
+        sender = "나" if mine else (u["name"] if u else f"사용자 {uid[-4:]}")
+        avatar = "" if mine else (u["avatar"] if u else "")
+        deleted = bool(_safe_int(r["deleted"]))
+        raw_msg = r["message"] or ""
+        raw_att = r["attachement"] or ""
+        att = _parse_json_obj(raw_att)
 
-        room = self.get_room(chat_id) or {"link_id": "0"}
-        link_id = room.get("link_id", "0")
-        with self._lock:
-            wms = list(self._room_watermarks.get(chat_id, []))
-            my_id = self._my_id
-            names_for_room = {uid: u["name"] for uid, u in self._users.items()}
-            for (uid, lid), u in self._open_users.items():
-                if lid == link_id:
-                    names_for_room[uid] = u["name"]
+        item: dict = {
+            "log_id": lid,
+            "at": _safe_int(r["sendAt"]),
+            "author_id": uid,
+            "sender": sender,
+            "avatar": avatar,
+            "mine": mine,
+            "type": typ,
+            "deleted": deleted,
+            "text": "",
+            "kind": "text",
+            "media": [],
+            "file": None,
+            "reply_to": None,
+            "card": None,
+            "unread": count_unread_fast(sorted_wms, wm_by_uid, uid, lid),
+        }
 
-        conn = open_decrypted_connection(p, key)
-        try:
-            rows = list(conn.execute(
-                "SELECT logId, authorId, type, sendAt, message, attachement, "
-                "COALESCE(deleted, 0) AS deleted, COALESCE(threadId, 0) AS threadId "
-                "FROM chatLogs ORDER BY sendAt ASC, logId ASC"
-            ))
-        finally:
-            conn.close()
-
-        by_log_id: dict[int, dict] = {}
-        parsed: list[dict] = []
-
-        for r in rows:
-            lid = _safe_int(r["logId"])
-            typ = _safe_int(r["type"], 1)
-            if typ == 0 or typ >= 16384:
-                continue
-            uid = str(r["authorId"])
-            mine = bool(my_id and uid == my_id)
-            u = self._resolve_user(uid, link_id)
-            sender = "나" if mine else (u["name"] if u else f"사용자 {uid[-4:]}")
-            avatar = "" if mine else (u["avatar"] if u else "")
-            deleted = bool(_safe_int(r["deleted"]))
-            raw_msg = r["message"] or ""
-            raw_att = r["attachement"] or ""
-            att = _parse_json_obj(raw_att)
-
-            item: dict = {
-                "log_id": lid,
-                "at": _safe_int(r["sendAt"]),
-                "author_id": uid,
-                "sender": sender,
-                "avatar": avatar,
-                "mine": mine,
-                "type": typ,
-                "deleted": deleted,
-                "text": "",
-                "kind": "text",
-                "media": [],
-                "file": None,
-                "reply_to": None,
-                "card": None,
-                "unread": sum(1 for m_uid, wm in wms if m_uid != uid and wm < lid),
-            }
-
-            if deleted:
-                item["kind"] = "deleted"
-                item["text"] = "삭제된 메시지입니다."
-            elif typ == 24:
-                item["kind"] = "system"
-                item["text"] = _format_feed_text(raw_msg, names_for_room)
-            elif typ == 2 and isinstance(att, dict):
-                item["kind"] = "image"
-                full_u = proxy_url(att.get("url"))
-                thumb_u = proxy_url(att.get("thumbnailUrl")) or full_u
-                if full_u or thumb_u:
+        if deleted:
+            item["kind"] = "deleted"
+            item["text"] = "삭제된 메시지입니다."
+        elif typ == 24:
+            item["kind"] = "system"
+            item["text"] = _format_feed_text(raw_msg, feed_names)
+        elif typ == 2 and isinstance(att, dict):
+            item["kind"] = "image"
+            full_u = proxy_url(att.get("url"))
+            thumb_u = proxy_url(att.get("thumbnailUrl")) or full_u
+            if full_u or thumb_u:
+                item["media"].append({
+                    "url": full_u or thumb_u,
+                    "thumb": thumb_u or full_u,
+                    "w": _safe_int(att.get("w")),
+                    "h": _safe_int(att.get("h")),
+                })
+            item["text"] = raw_msg.strip() if raw_msg and raw_msg != "사진" else ""
+        elif typ == 27 and isinstance(att, dict):
+            item["kind"] = "album"
+            urls = att.get("imageUrls") or []
+            thumbs = att.get("thumbnailUrls") or []
+            ws = att.get("wl") or []
+            hs = att.get("hl") or []
+            for idx in range(max(len(urls), len(thumbs))):
+                fu = proxy_url(urls[idx] if idx < len(urls) else "")
+                tu = proxy_url(thumbs[idx] if idx < len(thumbs) else "") or fu
+                if fu or tu:
                     item["media"].append({
-                        "url": full_u or thumb_u,
-                        "thumb": thumb_u or full_u,
-                        "w": _safe_int(att.get("w")),
-                        "h": _safe_int(att.get("h")),
+                        "url": fu or tu,
+                        "thumb": tu or fu,
+                        "w": _safe_int(ws[idx]) if idx < len(ws) else 0,
+                        "h": _safe_int(hs[idx]) if idx < len(hs) else 0,
                     })
-                item["text"] = raw_msg.strip() if raw_msg and raw_msg != "사진" else ""
-            elif typ == 27 and isinstance(att, dict):
-                item["kind"] = "album"
-                urls = att.get("imageUrls") or []
-                thumbs = att.get("thumbnailUrls") or []
-                ws = att.get("wl") or []
-                hs = att.get("hl") or []
-                for idx in range(max(len(urls), len(thumbs))):
-                    fu = proxy_url(urls[idx] if idx < len(urls) else "")
-                    tu = proxy_url(thumbs[idx] if idx < len(thumbs) else "") or fu
-                    if fu or tu:
-                        item["media"].append({
-                            "url": fu or tu,
-                            "thumb": tu or fu,
-                            "w": _safe_int(ws[idx]) if idx < len(ws) else 0,
-                            "h": _safe_int(hs[idx]) if idx < len(hs) else 0,
-                        })
-                item["text"] = ""
-            elif typ == 3 and isinstance(att, dict):
-                item["kind"] = "video"
-                tu = proxy_url(att.get("thumbnailUrl"))
-                vu = proxy_url(att.get("url"))
-                item["media"].append({"url": vu, "thumb": tu, "w": _safe_int(att.get("w")), "h": _safe_int(att.get("h"))})
-                item["text"] = "[동영상]"
-            elif typ == 18 and isinstance(att, dict):
-                item["kind"] = "file"
-                item["file"] = {
-                    "name": str(att.get("name") or "첨부파일"),
-                    "size": _safe_int(att.get("size")),
-                    "url": proxy_url(att.get("url")),
+            item["text"] = ""
+        elif typ == 3 and isinstance(att, dict):
+            item["kind"] = "video"
+            tu = proxy_url(att.get("thumbnailUrl"))
+            vu = proxy_url(att.get("url"))
+            item["media"].append({"url": vu, "thumb": tu, "w": _safe_int(att.get("w")), "h": _safe_int(att.get("h"))})
+            item["text"] = "[동영상]"
+        elif typ == 18 and isinstance(att, dict):
+            item["kind"] = "file"
+            item["file"] = {
+                "name": str(att.get("name") or "첨부파일"),
+                "size": _safe_int(att.get("size")),
+                "url": proxy_url(att.get("url")),
+            }
+            item["text"] = item["file"]["name"]
+        elif typ == 26:
+            item["kind"] = "reply"
+            item["text"] = raw_msg
+            if isinstance(att, dict):
+                src_id = _safe_int(att.get("src_logId"))
+                src_msg = str(att.get("src_message") or "")
+                src_uid = str(att.get("src_userId") or "")
+                src_u = self._resolve_user(src_uid, link_id)
+                src_sender = "나" if (my_id and src_uid == my_id) else (src_u["name"] if src_u else "상대방")
+                if not src_msg and src_id in reply_src_map:
+                    src_typ_db, src_raw_db = reply_src_map[src_id]
+                    src_msg = src_raw_db or format_last_preview(src_typ_db, "")
+                item["reply_to"] = {
+                    "log_id": src_id,
+                    "sender": src_sender,
+                    "text": src_msg or format_last_preview(_safe_int(att.get("src_type"), 1), ""),
                 }
-                item["text"] = item["file"]["name"]
-            elif typ == 26:
-                item["kind"] = "reply"
-                item["text"] = raw_msg
-                if isinstance(att, dict):
-                    src_id = _safe_int(att.get("src_logId"))
-                    src_msg = str(att.get("src_message") or "")
-                    src_uid = str(att.get("src_userId") or "")
-                    src_u = self._resolve_user(src_uid, link_id)
-                    src_sender = "나" if (my_id and src_uid == my_id) else (src_u["name"] if src_u else "상대방")
-                    if not src_msg and src_id in by_log_id:
-                        src_msg = by_log_id[src_id]["text"]
-                    item["reply_to"] = {
-                        "log_id": src_id,
-                        "sender": src_sender,
-                        "text": src_msg or format_last_preview(_safe_int(att.get("src_type"), 1), ""),
+        elif typ in (12, 20, 25):
+            item["kind"] = "emoticon"
+            item["text"] = raw_msg.strip() or "[이모티콘]"
+            if isinstance(att, dict):
+                raw_path = att.get("path") or att.get("emoticonItemPath")
+                play_res = emoticon_play_filename_from_path(raw_path)
+                thumb_res = emoticon_png_filename_from_path(raw_path, prefer_static_full=False)
+                if play_res or thumb_res:
+                    play_u = f"/api/emoticon-asset/{play_res[0]}/{play_res[1]}" if play_res else ""
+                    thumb_u = f"/api/emoticon-asset/{thumb_res[0]}/{thumb_res[1]}" if thumb_res else ""
+                    item["media"].append({"url": play_u or thumb_u, "thumb": thumb_u or play_u, "w": 140, "h": 140})
+                else:
+                    tu = proxy_url(att.get("thumbnailUrl") or att.get("url"))
+                    if tu:
+                        item["media"].append({"url": tu, "thumb": tu, "w": 120, "h": 120})
+        elif typ == 71:
+            item["kind"] = "card"
+            summary, card = _extract_rich_card(raw_msg, raw_att)
+            item["text"] = summary
+            item["card"] = card
+        else:
+            item["text"] = raw_msg or format_last_preview(typ, raw_msg, raw_att)
+            if isinstance(att, dict) and isinstance(att.get("universalScrapData"), dict):
+                sd = att["universalScrapData"]
+                if sd.get("title") or sd.get("url"):
+                    item["card"] = {
+                        "title": str(sd.get("title") or sd.get("url") or ""),
+                        "description": str(sd.get("description") or ""),
+                        "url": str(sd.get("url") or ""),
                     }
-            elif typ in (12, 20, 25):
-                item["kind"] = "emoticon"
-                item["text"] = raw_msg.strip() or "[이모티콘]"
-                if isinstance(att, dict):
-                    raw_path = att.get("path") or att.get("emoticonItemPath")
-                    play_res = emoticon_play_filename_from_path(raw_path)
-                    thumb_res = emoticon_png_filename_from_path(raw_path, prefer_static_full=False)
-                    if play_res or thumb_res:
-                        play_u = f"/api/emoticon-asset/{play_res[0]}/{play_res[1]}" if play_res else ""
-                        thumb_u = f"/api/emoticon-asset/{thumb_res[0]}/{thumb_res[1]}" if thumb_res else ""
-                        item["media"].append({"url": play_u or thumb_u, "thumb": thumb_u or play_u, "w": 140, "h": 140})
-                    else:
-                        tu = proxy_url(att.get("thumbnailUrl") or att.get("url"))
-                        if tu:
-                            item["media"].append({"url": tu, "thumb": tu, "w": 120, "h": 120})
-            elif typ == 71:
-                item["kind"] = "card"
-                summary, card = _extract_rich_card(raw_msg, raw_att)
-                item["text"] = summary
-                item["card"] = card
-            else:
-                item["text"] = raw_msg or format_last_preview(typ, raw_msg, raw_att)
-                if isinstance(att, dict) and isinstance(att.get("universalScrapData"), dict):
-                    sd = att["universalScrapData"]
-                    if sd.get("title") or sd.get("url"):
-                        item["card"] = {
-                            "title": str(sd.get("title") or sd.get("url") or ""),
-                            "description": str(sd.get("description") or ""),
-                            "url": str(sd.get("url") or ""),
-                        }
+        return item
 
-            by_log_id[lid] = item
-            parsed.append(item)
-
+    def _matching_author_ids(self, needle: str, link_id: str, my_id: str) -> list[str]:
+        matched: list[str] = []
+        seen: set[str] = set()
+        if my_id and needle in "나":
+            matched.append(my_id)
+            seen.add(my_id)
         with self._lock:
-            self._chat_cache[chat_id] = (sig, parsed)
-            self._chat_cache.move_to_end(chat_id)
-            while len(self._chat_cache) > MAX_CACHED_ROOMS:
-                self._chat_cache.popitem(last=False)
-        return parsed
+            open_users = list(self._open_users.items())
+            users = list(self._users.items())
+        if link_id and link_id != "0":
+            for (uid, lid), u in open_users:
+                if lid == link_id and uid not in seen and needle in u["name"].lower():
+                    matched.append(uid)
+                    seen.add(uid)
+                    if len(matched) >= 50:
+                        return matched
+        for uid, u in users:
+            if uid not in seen and needle in u["name"].lower():
+                matched.append(uid)
+                seen.add(uid)
+                if len(matched) >= 50:
+                    break
+        return matched
 
     def get_messages(self, chat_id: str, limit: int = 80, before_log_id: int = 0, q: str = "") -> dict:
+        if not _CHAT_ID_RE.match(chat_id):
+            return {"found": False, "unlocked": False, "messages": [], "has_more": False}
         room = self.get_room(chat_id)
         if room is None:
             return {"found": False, "unlocked": False, "messages": [], "has_more": False}
-        msgs = self._load_room_messages(chat_id)
-        if msgs is None:
+
+        with self._lock:
+            self._watched_rooms[chat_id] = time.monotonic()
+            self._watched_rooms.move_to_end(chat_id)
+            while len(self._watched_rooms) > MAX_WATCHED_ROOMS:
+                self._watched_rooms.popitem(last=False)
+
+        kid = f"chatLogs_{chat_id}.edb"
+        p = self._db_path(kid)
+        if not p or not os.path.exists(p):
+            return {"found": True, "room": room, "unlocked": False, "messages": [], "has_more": False}
+        key = self.keys.get(kid)
+        if not key:
             return {"found": True, "room": room, "unlocked": False, "messages": [], "has_more": False}
 
-        needle = q.strip().lower()
-        filtered = msgs
-        if needle:
-            filtered = [m for m in filtered if needle in m["text"].lower() or needle in m["sender"].lower()]
-        if before_log_id > 0:
-            filtered = [m for m in filtered if m["log_id"] < before_log_id]
-
         lim = max(1, min(limit, 300))
-        has_more = len(filtered) > lim
-        sliced = filtered[-lim:]
-        return {
-            "found": True,
-            "room": room,
-            "unlocked": True,
-            "messages": sliced,
-            "has_more": has_more,
-            "total": len(msgs),
-        }
+        needle = q.strip().lower()
+        cache_key = (chat_id, lim, before_log_id, needle)
+        sig = file_signature(p)
+        with self._lock:
+            cached = self._chat_cache.get(cache_key)
+            if cached and cached[0] == sig:
+                self._chat_cache.move_to_end(cache_key)
+                return cached[1]
+
+        with self._room_lock(chat_id):
+            sig = file_signature(p)
+            with self._lock:
+                cached = self._chat_cache.get(cache_key)
+                if cached and cached[0] == sig:
+                    self._chat_cache.move_to_end(cache_key)
+                    return cached[1]
+                sorted_wms, wm_by_uid = self._room_wm_index.get(chat_id, ([], {}))
+                if not sorted_wms and chat_id in self._room_watermarks:
+                    sorted_wms, wm_by_uid = build_watermark_index(self._room_watermarks[chat_id])
+                my_id = self._my_id
+
+            link_id = room.get("link_id", "0")
+            conn = open_decrypted_connection(p, key)
+            try:
+                total = _safe_int(
+                    conn.execute("SELECT COUNT(*) FROM chatLogs WHERE type != 0 AND type < 16384").fetchone()[0]
+                )
+                where = ["type != 0", "type < 16384"]
+                params: list = []
+                if before_log_id > 0:
+                    where.append("logId < ?")
+                    params.append(before_log_id)
+                if needle:
+                    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    like_pat = f"%{escaped}%"
+                    author_hits = self._matching_author_ids(needle, link_id, my_id)
+                    if author_hits:
+                        ph = ",".join("?" for _ in author_hits)
+                        where.append(f"(LOWER(COALESCE(message, '')) LIKE ? ESCAPE '\\' OR authorId IN ({ph}))")
+                        params.append(like_pat)
+                        params.extend(author_hits)
+                    else:
+                        where.append("LOWER(COALESCE(message, '')) LIKE ? ESCAPE '\\'")
+                        params.append(like_pat)
+
+                sql = (
+                    "SELECT logId, authorId, type, sendAt, message, attachement, "
+                    "COALESCE(deleted, 0) AS deleted, COALESCE(threadId, 0) AS threadId "
+                    f"FROM chatLogs WHERE {' AND '.join(where)} ORDER BY logId DESC LIMIT ?"
+                )
+                params.append(lim + 1)
+                rows = list(conn.execute(sql, params))
+                has_more = len(rows) > lim
+                rows = rows[:lim]
+                rows.reverse()
+
+                missing_src_ids: list[int] = []
+                for r in rows:
+                    if _safe_int(r["type"], 1) == 26 and not _safe_int(r["deleted"]):
+                        att = _parse_json_obj(r["attachement"] or "")
+                        if isinstance(att, dict) and not att.get("src_message"):
+                            sid = _safe_int(att.get("src_logId"))
+                            if sid > 0:
+                                missing_src_ids.append(sid)
+
+                reply_src_map: dict[int, tuple[int, str]] = {}
+                if missing_src_ids:
+                    uniq_ids = list(dict.fromkeys(missing_src_ids))[:100]
+                    ph = ",".join("?" for _ in uniq_ids)
+                    for sr in conn.execute(
+                        f"SELECT logId, type, message FROM chatLogs WHERE logId IN ({ph})", uniq_ids
+                    ):
+                        reply_src_map[_safe_int(sr["logId"])] = (
+                            _safe_int(sr["type"], 1),
+                            str(sr["message"] or ""),
+                        )
+            finally:
+                conn.close()
+
+            feed_names = _FeedNameLookup(self._resolve_user, link_id)
+            parsed = [
+                self._parse_chat_row(r, link_id, my_id, sorted_wms, wm_by_uid, feed_names, reply_src_map)
+                for r in rows
+            ]
+            result = {
+                "found": True,
+                "room": room,
+                "unlocked": True,
+                "messages": parsed,
+                "has_more": has_more,
+                "total": total,
+            }
+            with self._lock:
+                self._chat_cache[cache_key] = (sig, result)
+                self._chat_cache.move_to_end(cache_key)
+                while len(self._chat_cache) > MAX_CACHED_QUERIES:
+                    self._chat_cache.popitem(last=False)
+            return result
 
     def resolve_emoticon_asset_path(self, item_code: str, filename: str) -> Path | None:
         if not _EMOT_CODE_RE.match(item_code or "") or not _EMOT_ASSET_RE.match(filename or ""):
@@ -1133,6 +1281,7 @@ class KakaoStore:
     def _watch_loop(self) -> None:
         last_list_sig: tuple | None = None
         last_chat_sigs: dict[str, tuple] = {}
+        last_chat_emit: dict[str, float] = {}
         while not self._stop_watch.is_set():
             try:
                 acc = self._acc()
@@ -1141,23 +1290,25 @@ class KakaoStore:
                     lsig = file_signature(list_path)
                     if last_list_sig is not None and lsig != last_list_sig:
                         now = time.monotonic()
-                        if now - self._last_rooms_reload >= 0.8:
+                        if now - self._last_rooms_reload >= 2.0:
                             self._last_rooms_reload = now
-                            self._load_rooms_if_changed()
+                            self._load_rooms_if_changed(blocking=False)
                             self._broadcast("rooms_updated", {"reason": "db_change"})
                     last_list_sig = lsig
 
                     chat_dir = os.path.join(acc, "chat_data")
-                    # Watch cached rooms + any rooms with unlocked keys
                     with self._lock:
-                        watch_ids = list(self._chat_cache.keys())
+                        watch_ids = list(self._watched_rooms.keys())
+                    now = time.monotonic()
                     for cid in watch_ids:
                         p = os.path.join(chat_dir, f"chatLogs_{cid}.edb")
                         sig = file_signature(p)
                         prev = last_chat_sigs.get(cid)
                         if prev is not None and sig != prev:
-                            self._broadcast("room_messages_updated", {"chat_id": cid})
+                            if now - last_chat_emit.get(cid, 0.0) >= 1.0:
+                                last_chat_emit[cid] = now
+                                self._broadcast("room_messages_updated", {"chat_id": cid})
                         last_chat_sigs[cid] = sig
             except Exception:
                 pass
-            self._stop_watch.wait(0.5)
+            self._stop_watch.wait(0.8)
